@@ -104,7 +104,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/V') || github.event_name == 'release'
         with:
           tag_name: ${{ github.event.release.tag_name || github.ref_name }}
-                    name: Release ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
           body: |
             🎉 **New release of Vers Suite**
 
