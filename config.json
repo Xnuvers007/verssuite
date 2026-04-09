@@ -1,0 +1,10 @@
+{
+  "host": "127.0.0.1",
+  "port": 8080,
+  "intercept_enabled": true,
+  "response_intercept_enabled": true,
+  "scope_enabled": true,
+  "scope_rules": [],
+  "match_replace_enabled": false,
+  "match_replace_rules": []
+}
