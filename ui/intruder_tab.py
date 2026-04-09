@@ -1,7 +1,7 @@
 """
 Vers Suite - Intruder Tab
 Automated payload injection (OWASP Top 10 categories).
-Modes: Sniper | Battering Ram | Pitchfork (Cluster Bomb coming soon)
+Modes: Sniper | Battering Ram | Cluster Bomb
 """
 
 import os
@@ -25,6 +25,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
 from PyQt5.QtGui import QColor, QFont, QTextCursor, QTextCharFormat
 from .styles import status_color, COLORS
 from .intercept_tab import HttpHighlighter
+import itertools
 
 
 PAYLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "payloads")
@@ -34,17 +35,18 @@ PAYLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "payloads
 # Attack Worker
 # ─────────────────────────────────────────────
 class AttackWorker(QObject):
-    result  = pyqtSignal(int, str, int, int, float)  # (idx, payload, status, length, ms)
+    result  = pyqtSignal(int, str, int, int, float)  # (idx, payload_str, status, length, ms)
     progress = pyqtSignal(int, int)                   # (done, total)
     finished = pyqtSignal()
     stopped  = pyqtSignal()
 
-    def __init__(self, host, port, raw_template, payloads, use_ssl, concurrency=5, timeout=10):
+    def __init__(self, host, port, raw_template, mode, payload_sets, use_ssl, concurrency=5, timeout=10):
         super().__init__()
         self.host        = host
         self.port        = port
-        self.raw_template = raw_template    # Contains §marker§ positions
-        self.payloads    = payloads
+        self.raw_template = raw_template
+        self.mode        = mode             # "Sniper", "Battering Ram", "Cluster Bomb"
+        self.payload_sets = payload_sets    # dict of {set_idx (int): list of payloads}
         self.use_ssl     = use_ssl
         self.concurrency = concurrency
         self.timeout     = timeout
@@ -54,24 +56,55 @@ class AttackWorker(QObject):
         self._stop = True
 
     def run(self):
-        total = len(self.payloads)
-        sema  = threading.Semaphore(self.concurrency)
         lock  = threading.Lock()
         done  = [0]
         threads = []
+        tasks = []
 
-        for idx, payload in enumerate(self.payloads):
+        # Find markers
+        marker_count = self.raw_template.count("§") // 2
+        if marker_count == 0:
+            marker_count = 1
+
+        # Build task list depending on mode
+        if self.mode == "Sniper":
+            set1 = self.payload_sets.get(1, [])
+            for m_idx in range(marker_count):
+                for p in set1:
+                    tasks.append((m_idx, [p]))
+
+        elif self.mode == "Battering Ram":
+            set1 = self.payload_sets.get(1, [])
+            for p in set1:
+                tasks.append((None, [p] * marker_count))
+
+        elif self.mode == "Cluster Bomb":
+            lists = [self.payload_sets.get(i + 1, []) for i in range(marker_count)]
+            # If a list is empty for a marker, use a default empty string so product doesn't yield nothing
+            lists = [l if l else [""] for l in lists]
+            for combo in itertools.product(*lists):
+                tasks.append((None, list(combo)))
+
+        total = len(tasks)
+        if total == 0:
+            self.finished.emit()
+            return
+
+        sema  = threading.Semaphore(self.concurrency)
+
+        for idx, (m_idx, p_list) in enumerate(tasks):
             if self._stop:
                 self.stopped.emit()
                 return
 
-            def task(i=idx, p=payload):
+            def task(i=idx, m=m_idx, pl=p_list):
                 sema.acquire()
                 try:
                     if self._stop:
                         return
-                    status, length, ms = self._send_one(p)
-                    self.result.emit(i, p, status, length, ms)
+                    status, length, ms = self._send_one(m, pl)
+                    p_str = " | ".join(pl)
+                    self.result.emit(i, p_str[:100], status, length, ms)
                     with lock:
                         done[0] += 1
                         self.progress.emit(done[0], total)
@@ -88,10 +121,28 @@ class AttackWorker(QObject):
         if not self._stop:
             self.finished.emit()
 
-    def _send_one(self, payload: str) -> Tuple[int, int, float]:
+    def _send_one(self, target_marker_idx: Optional[int], mapped_payloads: List[str]) -> Tuple[int, int, float]:
         try:
-            # Inject payload into §...§ markers (replace ALL markers with same payload = Sniper)
-            raw = re.sub(r"§[^§]*§", payload, self.raw_template)
+            # Reconstruct request by replacing markers
+            parts = self.raw_template.split("§")
+            if len(parts) % 2 == 0:
+                parts.append("") # Malformed markers, fallback
+
+            raw = ""
+            for i, part in enumerate(parts):
+                if i % 2 == 0:
+                    raw += part
+                else:
+                    marker_idx = i // 2
+                    if target_marker_idx is not None:
+                        # Sniper mode: only inject one marker, clear others
+                        if marker_idx == target_marker_idx:
+                            raw += mapped_payloads[0]
+                    else:
+                        # Battering Ram / Cluster Bomb: inject mapped payload
+                        if marker_idx < len(mapped_payloads):
+                            raw += mapped_payloads[marker_idx]
+
             raw = raw.replace("\r\n", "\n").replace("\n", "\r\n")
             if not raw.endswith("\r\n\r\n"):
                 raw += "\r\n\r\n"
@@ -118,17 +169,16 @@ class AttackWorker(QObject):
             resp_raw = b"".join(chunks)
             status = 0
             first_line = resp_raw.split(b"\r\n")[0].decode("utf-8", errors="replace")
-            parts = first_line.split()
-            if len(parts) >= 2:
+            resp_parts = first_line.split()
+            if len(resp_parts) >= 2:
                 try:
-                    status = int(parts[1])
+                    status = int(resp_parts[1])
                 except ValueError:
                     pass
             return status, len(resp_raw), round(elapsed, 1)
 
         except Exception:
             return 0, 0, 0.0
-
 
 # ─────────────────────────────────────────────
 # Intruder Tab
@@ -139,6 +189,8 @@ class IntruderTab(QWidget):
         self._worker  = None
         self._thread  = None
         self._results: list = []
+        self._payload_sets: dict = {i: "" for i in range(1, 11)} # up to 10 sets
+        self._current_set = 1
         self._setup_ui()
         self._load_payload_list()
 
@@ -224,7 +276,7 @@ class IntruderTab(QWidget):
         h3 = QHBoxLayout()
         h3.addWidget(QLabel("Mode:"))
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["Sniper", "Battering Ram"])
+        self.mode_combo.addItems(["Sniper", "Battering Ram", "Cluster Bomb"])
         h3.addWidget(self.mode_combo)
         atk_layout.addLayout(h3)
 
@@ -252,6 +304,15 @@ class IntruderTab(QWidget):
         pl_layout = QVBoxLayout(pl_group)
         pl_layout.setSpacing(6)
 
+        ps_src = QHBoxLayout()
+        ps_src.addWidget(QLabel("Payload Set:"))
+        self.payload_set_combo = QComboBox()
+        self.payload_set_combo.addItems([str(i) for i in range(1, 11)])
+        self.payload_set_combo.currentTextChanged.connect(self._on_payload_set_change)
+        ps_src.addWidget(self.payload_set_combo)
+        ps_src.addStretch()
+        pl_layout.addLayout(ps_src)
+
         pl_src = QHBoxLayout()
         pl_src.addWidget(QLabel("Category:"))
         self.payload_combo = QComboBox()
@@ -264,6 +325,7 @@ class IntruderTab(QWidget):
         self.payload_edit.setPlaceholderText("One payload per line…")
         self.payload_edit.setFont(QFont("Cascadia Code", 10))
         self.payload_edit.setMaximumHeight(180)
+        self.payload_edit.textChanged.connect(self._on_payload_text_changed)
         pl_layout.addWidget(self.payload_edit)
 
         btn_load_file = QPushButton("📂  Load from file…")
@@ -389,7 +451,23 @@ class IntruderTab(QWidget):
                     label = fname.replace(".txt", "").replace("_", " ").title()
                     self.payload_combo.addItem(label, userData=os.path.join(PAYLOAD_DIR, fname))
 
+    def _on_payload_set_change(self, text):
+        if not text.isdigit():
+            return
+        new_set = int(text)
+        self._current_set = new_set
+        self.payload_edit.blockSignals(True)
+        self.payload_edit.setPlainText(self._payload_sets[new_set])
+        self.payload_edit.blockSignals(False)
+        self._update_payload_count()
+
+    def _on_payload_text_changed(self):
+        self._payload_sets[self._current_set] = self.payload_edit.toPlainText()
+        self._update_payload_count()
+
     def _on_payload_select(self, text):
+        if text.startswith("—"):
+            return
         idx  = self.payload_combo.currentIndex()
         path = self.payload_combo.itemData(idx)
         if not path or not os.path.exists(path):
@@ -400,6 +478,7 @@ class IntruderTab(QWidget):
             self.payload_edit.setPlainText(content)
         except Exception as e:
             self.payload_edit.setPlainText(f"Error loading: {e}")
+        self.payload_combo.setCurrentIndex(0)
 
     def _load_payload_file(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -414,7 +493,7 @@ class IntruderTab(QWidget):
 
     def _update_payload_count(self):
         lines = [l for l in self.payload_edit.toPlainText().split("\n") if l.strip()]
-        self.lbl_payload_count.setText(f"{len(lines)} payloads")
+        self.lbl_payload_count.setText(f"{len(lines)} payloads in Set {self._current_set}")
 
     def _add_marker(self):
         cursor = self.request_edit.textCursor()
@@ -429,20 +508,23 @@ class IntruderTab(QWidget):
         text = re.sub(r"§([^§]*)§", r"\1", text)
         self.request_edit.setPlainText(text)
 
-    def _get_payloads(self) -> List[str]:
-        return [l.strip() for l in self.payload_edit.toPlainText().split("\n") if l.strip()]
+    def _get_payloads_dict(self) -> dict:
+        result = {}
+        for k, v in self._payload_sets.items():
+            lines = [l.strip() for l in v.split("\n") if l.strip()]
+            if lines:
+                result[k] = lines
+        return result
 
     def _on_attack(self):
         raw_tpl  = self.request_edit.toPlainText().strip()
-        payloads = self._get_payloads()
+        payload_sets = self._get_payloads_dict()
+        mode = self.mode_combo.currentText()
 
         if not raw_tpl:
             return
-        if not payloads:
+        if not payload_sets:
             return
-        if "§" not in raw_tpl:
-            # Auto-wrap the last word / value
-            raw_tpl += "\n\n§FUZZ§"
 
         host    = self.host_input.text().strip() or "127.0.0.1"
         port    = self.port_input.value()
@@ -451,13 +533,12 @@ class IntruderTab(QWidget):
         timeout = self.timeout_spin.value()
 
         self._clear_results()
-        self.progress_bar.setMaximum(len(payloads))
         self.btn_attack.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self._attack_start = time.time()
 
         self._thread = QThread()
-        self._worker = AttackWorker(host, port, raw_tpl, payloads, use_ssl, threads, timeout)
+        self._worker = AttackWorker(host, port, raw_tpl, mode, payload_sets, use_ssl, threads, timeout)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.result.connect(self._on_result)

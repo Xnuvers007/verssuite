@@ -10,18 +10,26 @@ from PyQt5.QtWidgets import (
     QLineEdit, QSpinBox, QFrame, QDialog, QTextEdit,
     QSplitter, QAction, QMenuBar, QMessageBox
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSlot, QUrl
+from PyQt5.QtCore import Qt, QTimer, pyqtSlot, QUrl, QObject, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QIcon, QColor, QPalette, QDesktopServices
 
 from core import (
     ProxyServer, cert_exists, get_install_instructions, open_cert_dir,
-    load_config, save_config
+    load_config, save_config, APP_VERSION, APP_AUTHOR, REPO_URL,
+    check_for_updates, ScopeManager, MatchReplaceEngine, save_session, load_session
 )
 from .intercept_tab import InterceptTab
 from .history_tab   import HistoryTab
 from .repeater_tab  import RepeaterTab
 from .intruder_tab  import IntruderTab
+from .comparer_tab  import ComparerTab
+from .sequencer_tab import SequencerTab
+from .websocket_tab import WebSocketTab
+from .scope_dialog  import ScopeDialog
+from .match_replace_dialog import MatchReplaceDialog
 from .styles        import DARK_STYLESHEET, COLORS
+from PyQt5.QtWidgets import QFileDialog, QShortcut
+from PyQt5.QtGui import QKeySequence
 
 
 # ─────────────────────────────────────────────
@@ -64,17 +72,33 @@ class CertDialog(QDialog):
         layout.addLayout(btn_bar)
 
 
+class UpdateCheckWorker(QObject):
+    finished = pyqtSignal(object)
+
+    def run(self):
+        result = check_for_updates(APP_VERSION)
+        self.finished.emit(result)
+
+
 # ─────────────────────────────────────────────
 # Main Window
 # ─────────────────────────────────────────────
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.scope_manager = ScopeManager()
+        self.match_replace_engine = MatchReplaceEngine()
         self.proxy = ProxyServer()
+        self.proxy.scope_manager = self.scope_manager
+        self.proxy.match_replace_engine = self.match_replace_engine
+
         self._req_count  = 0
+        self._update_thread = None
+        self._update_worker = None
         self._poll_timer = QTimer()
         self._setup_ui()
         self._setup_connections()
+        self._setup_shortcuts()
         self._apply_config()
         self._poll_timer.timeout.connect(self._poll_proxy_events)
         self._poll_timer.start(80)   # Poll every 80 ms
@@ -83,7 +107,7 @@ class MainWindow(QMainWindow):
     # UI Setup
     # ══════════════════════════════════════════
     def _setup_ui(self):
-        self.setWindowTitle("Vers Suite  ·  by Xnuvers007")
+        self.setWindowTitle(f"Vers Suite  ·  v{APP_VERSION}  ·  by {APP_AUTHOR}")
         self.setMinimumSize(1200, 780)
         self.setStyleSheet(DARK_STYLESHEET)
 
@@ -92,6 +116,8 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
+
+        self._build_menus()
 
         # ── Header bar ─────────────────────────
         header = self._build_header()
@@ -120,13 +146,23 @@ class MainWindow(QMainWindow):
 
         self.repeater_tab  = RepeaterTab()
         self.intruder_tab  = IntruderTab()
+        self.comparer_tab  = ComparerTab()
+        self.sequencer_tab = SequencerTab()
+        self.websocket_tab = WebSocketTab()
 
         self.repeater_page = RepeaterWidget(self.repeater_tab)
         self.intruder_page = IntruderWidget(self.intruder_tab)
+        self.comparer_page = QWidget()
+        cl = QVBoxLayout(self.comparer_page)
+        cl.setContentsMargins(0,0,0,0)
+        cl.addWidget(self.comparer_tab)
 
         self.tabs.addTab(self.proxy_page,      "🔀  Proxy")
         self.tabs.addTab(self.repeater_page,   "🔁  Repeater")
         self.tabs.addTab(self.intruder_page,   "⚡  Intruder")
+        self.tabs.addTab(self.comparer_page,   "⇄  Comparer")
+        self.tabs.addTab(self.sequencer_tab,   "🔬  Sequencer")
+        self.tabs.addTab(self.websocket_tab,   "🔌  WebSocket")
         self.tabs.addTab(self._build_decoder_tab(), "🔧  Decoder")
         self.tabs.addTab(self._build_about_tab(),   "ℹ  About")
 
@@ -148,6 +184,68 @@ class MainWindow(QMainWindow):
         self.status_bar.addWidget(self.lbl_req_count)
         self.setStatusBar(self.status_bar)
 
+    def _build_menus(self):
+        menubar = self.menuBar()
+        
+        file_menu = menubar.addMenu("&File")
+        
+        save_act = QAction("Save Session\tCtrl+S", self)
+        save_act.triggered.connect(self._save_session)
+        file_menu.addAction(save_act)
+
+        load_act = QAction("Load Session\tCtrl+O", self)
+        load_act.triggered.connect(self._load_session)
+        file_menu.addAction(load_act)
+
+        file_menu.addSeparator()
+        
+        exit_act = QAction("Exit", self)
+        exit_act.triggered.connect(self.close)
+        file_menu.addAction(exit_act)
+
+        project_menu = menubar.addMenu("&Project")
+        scope_act = QAction("Target Scope", self)
+        scope_act.triggered.connect(self._show_scope_dialog)
+        project_menu.addAction(scope_act)
+
+        rules_act = QAction("Match && Replace Rules", self)
+        rules_act.triggered.connect(self._show_match_replace_dialog)
+        project_menu.addAction(rules_act)
+
+        help_menu = menubar.addMenu("&Help")
+        cert_act = QAction("Install CA Certificate", self)
+        cert_act.triggered.connect(self._show_cert_dialog)
+        help_menu.addAction(cert_act)
+
+        changelogs_act = QAction("Changelogs", self)
+        changelogs_act.triggered.connect(self._show_changelogs)
+        help_menu.addAction(changelogs_act)
+
+        update_act = QAction("Check for Updates", self)
+        update_act.triggered.connect(self._on_check_update)
+        help_menu.addAction(update_act)
+
+    def _show_changelogs(self):
+        changelogs_text = (
+            "<h3>What's New in v1.1.0</h3>"
+            "<ul>"
+            "<li><b>UI Overhaul:</b> Implemented a professional Menu Bar for File, Project, and Help options.</li>"
+            "<li><b>Cleaner Layout:</b> Fixed truncated text and crowded buttons in the header to give it a clean, Burp Suite-like appearance.</li>"
+            "<li><b>Version Bump:</b> Officially migrated from v1.0.1 to v1.1.0 for better semantic versioning!</li>"
+            "</ul><br>"
+            "<h3>Previous (v1.0.1)</h3>"
+            "<ul>"
+            "<li>Added Response Interception functionality.</li>"
+            "<li>Hotfixes for payload loading and proxy state toggling.</li>"
+            "<li>Initial stable release.</li>"
+            "</ul>"
+        )
+        box = QMessageBox(self)
+        box.setWindowTitle("Vers Suite - Changelogs")
+        box.setTextFormat(Qt.RichText)
+        box.setText(changelogs_text)
+        box.exec_()
+
     def _build_header(self) -> QWidget:
         header = QWidget()
         header.setFixedHeight(60)
@@ -166,7 +264,7 @@ class MainWindow(QMainWindow):
         brand.setFont(QFont("Segoe UI", 16, QFont.Bold))
         hl.addWidget(brand)
 
-        ver = QLabel("v1.0  |  by Xnuvers007")
+        ver = QLabel(f"v{APP_VERSION}  |  by {APP_AUTHOR}")
         ver.setObjectName("subtitle_label")
         hl.addWidget(ver)
 
@@ -207,21 +305,19 @@ class MainWindow(QMainWindow):
         line2.setStyleSheet("color:#1e1e2e;")
         hl.addWidget(line2)
 
-        # Intercept toggle
         self.btn_intercept = QPushButton("⬤  Intercept: OFF")
         self.btn_intercept.setObjectName("btn_intercept_on")
         self.btn_intercept.setCheckable(True)
         self.btn_intercept.clicked.connect(self._on_intercept_toggle)
         hl.addWidget(self.btn_intercept)
 
-        hl.addStretch()
+        self.btn_resp_intercept = QPushButton("⬤  Resp Int: OFF")
+        self.btn_resp_intercept.setObjectName("btn_intercept_on")
+        self.btn_resp_intercept.setCheckable(True)
+        self.btn_resp_intercept.clicked.connect(self._on_resp_intercept_toggle)
+        hl.addWidget(self.btn_resp_intercept)
 
-        # Certificate button
-        self.btn_cert = QPushButton("🔒  SSL Cert")
-        self.btn_cert.setObjectName("btn_cert")
-        self.btn_cert.setToolTip("Show browser certificate installation instructions")
-        self.btn_cert.clicked.connect(self._show_cert_dialog)
-        hl.addWidget(self.btn_cert)
+        hl.addStretch()
 
         return header
 
@@ -288,8 +384,8 @@ class MainWindow(QMainWindow):
         ))
 
         for line in [
-            "Author   : Xnuvers007",
-            "Version  : 1.0.0",
+            f"Author   : {APP_AUTHOR}",
+            f"Version  : {APP_VERSION}",
             "Engine   : mitmproxy (MITM + SSL CA)",
             "UI       : PyQt5",
             "",
@@ -360,10 +456,25 @@ class MainWindow(QMainWindow):
         self.intercept_tab.drop_signal.connect(self._on_drop)
         self.intercept_tab.forward_all_signal.connect(self._on_forward_all)
         self.intercept_tab.drop_all_signal.connect(self._on_drop_all)
+        self.intercept_tab.response_forward_signal.connect(self._on_response_forward)
+        self.intercept_tab.response_drop_signal.connect(self._on_response_drop)
 
         # History tab → repeater/intruder
         self.history_tab.send_to_repeater.connect(self._to_repeater)
         self.history_tab.send_to_intruder.connect(self._to_intruder)
+
+    def _setup_shortcuts(self):
+        QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(self.intercept_tab.btn_forward.click)
+        QShortcut(QKeySequence("Ctrl+D"), self).activated.connect(self.intercept_tab.btn_drop.click)
+        QShortcut(QKeySequence("Ctrl+Shift+F"), self).activated.connect(self.intercept_tab.btn_forward_all.click)
+        QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(self.intercept_tab.btn_to_repeater.click)
+        QShortcut(QKeySequence("Ctrl+I"), self).activated.connect(self.intercept_tab.btn_to_intruder.click)
+        QShortcut(QKeySequence("Ctrl+Enter"), self).activated.connect(self.repeater_tab.btn_send.click)
+        QShortcut(QKeySequence("Ctrl+S"), self).activated.connect(self._save_session)
+        QShortcut(QKeySequence("Ctrl+O"), self).activated.connect(self._load_session)
+        for i in range(1, 9):
+            QShortcut(QKeySequence(f"Ctrl+{i}"), self).activated.connect(lambda idx=i-1: self.tabs.setCurrentIndex(idx) if idx < self.tabs.count() else None)
+
 
     # ══════════════════════════════════════════
     # Proxy lifecycle
@@ -408,6 +519,29 @@ class MainWindow(QMainWindow):
             self.lbl_intercept_status.setStyleSheet("color:#505070;")
         self._save_config()
 
+    @pyqtSlot(bool)
+    def _on_resp_intercept_toggle(self, checked):
+        if checked:
+            self.proxy.enable_response_intercept()
+            self.btn_resp_intercept.setText("⬤  Resp Int: ON")
+            self.btn_resp_intercept.setStyleSheet("background:#1a0033; color:#ea00ff; border:1px solid #ea00ff; font-weight:700; padding:7px 18px;")
+        else:
+            self.proxy.disable_response_intercept()
+            self.btn_resp_intercept.setText("⬤  Resp Int: OFF")
+            self.btn_resp_intercept.setStyleSheet("")
+            self.proxy.flush_response_intercepts()
+        self._save_config()
+
+    def _show_scope_dialog(self):
+        dlg = ScopeDialog(self.scope_manager, self)
+        dlg.exec_()
+        self._save_config()
+
+    def _show_match_replace_dialog(self):
+        dlg = MatchReplaceDialog(self.match_replace_engine, self)
+        dlg.exec_()
+        self._save_config()
+
     # ══════════════════════════════════════════
     # Proxy event polling
     # ══════════════════════════════════════════
@@ -448,8 +582,15 @@ class MainWindow(QMainWindow):
             self.history_tab.add_request(event)
 
         elif t == "response":
-            self.history_tab.update_response(event)
             self.intercept_tab.update_response_meta(event)
+            self.history_tab.update_response(event)
+
+        elif t == "response_intercept":
+            self.intercept_tab.show_intercepted_response(event)
+            self.history_tab.update_response(event)
+
+        elif t == "websocket":
+            self.websocket_tab.add_message(event)
 
     # ══════════════════════════════════════════
     # Intercept actions
@@ -470,6 +611,14 @@ class MainWindow(QMainWindow):
     def _on_drop_all(self):
         self.proxy.drop_all_intercepts()
 
+    @pyqtSlot(str, dict)
+    def _on_response_forward(self, flow_id: str, mods: dict):
+        self.proxy.forward_response(flow_id, mods)
+
+    @pyqtSlot(str)
+    def _on_response_drop(self, flow_id: str):
+        self.proxy.drop_response(flow_id)
+
     @pyqtSlot(str, tuple)
     def _to_repeater(self, raw: str, host_port: tuple):
         self.repeater_tab.load_request(raw, host_port)
@@ -488,6 +637,64 @@ class MainWindow(QMainWindow):
         port = self.port_input.value()
         dlg = CertDialog(host, port, self)
         dlg.exec_()
+
+    @pyqtSlot()
+    def _on_check_update(self):
+        if self._update_thread is not None and self._update_thread.isRunning():
+            return
+
+        self.status_bar.showMessage("Checking updates...", 2000)
+
+        self._update_thread = QThread(self)
+        self._update_worker = UpdateCheckWorker()
+        self._update_worker.moveToThread(self._update_thread)
+
+        self._update_thread.started.connect(self._update_worker.run)
+        self._update_worker.finished.connect(self._on_update_check_finished)
+        self._update_worker.finished.connect(self._update_thread.quit)
+        self._update_worker.finished.connect(self._update_worker.deleteLater)
+        self._update_thread.finished.connect(self._update_thread.deleteLater)
+        self._update_thread.start()
+
+    @pyqtSlot(object)
+    def _on_update_check_finished(self, result):
+        self._update_worker = None
+        self._update_thread = None
+
+        status = result.get("status", "error")
+        latest = result.get("latest_version") or "unknown"
+        url = result.get("url") or REPO_URL
+        message = result.get("message", "Failed to check updates.")
+
+        if status == "update-available":
+            reply = QMessageBox.question(
+                self,
+                "Update Available",
+                (
+                    f"Current version: {APP_VERSION}\n"
+                    f"Latest version: {latest}\n\n"
+                    "Open release page now?"
+                ),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if reply == QMessageBox.Yes:
+                self._open_url(url)
+            return
+
+        if status == "up-to-date":
+            QMessageBox.information(
+                self,
+                "Check Update",
+                f"You are already on the latest version ({latest}).",
+            )
+            return
+
+        QMessageBox.warning(
+            self,
+            "Check Update",
+            f"{message}\n\nYou can check manually at:\n{REPO_URL}",
+        )
 
     # ══════════════════════════════════════════
     # Decoder actions
@@ -538,19 +745,100 @@ class MainWindow(QMainWindow):
 
         event.accept()
 
+    # ══════════════════════════════════════════
+    # Session Management
+    # ══════════════════════════════════════════
+    def _save_session(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Project Session", "project.verssuite", "Vers Suite Sessions (*.verssuite)"
+        )
+        if not path:
+            return
+
+        data = {
+            "history_flows": list(self.history_tab._flows.values()),
+            "history_responses": self.history_tab._responses,
+            "history_notes": self.history_tab.get_notes(),
+            "repeater_sessions": self.repeater_tab.export_sessions(),
+            "scope_rules": self.scope_manager.to_list(),
+            "scope_enabled": self.scope_manager.enabled,
+            "match_replace_rules": self.match_replace_engine.to_list(),
+            "match_replace_enabled": self.match_replace_engine.enabled,
+            "config": load_config()
+        }
+
+        if save_session(path, data):
+            QMessageBox.information(self, "Success", "Session saved successfully.")
+        else:
+            QMessageBox.critical(self, "Error", "Failed to save session.")
+
+    def _load_session(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Project Session", "", "Vers Suite Sessions (*.verssuite)"
+        )
+        if not path:
+            return
+
+        data = load_session(path)
+        if not data:
+            QMessageBox.critical(self, "Error", "Failed to load session (invalid or corrupted file).")
+            return
+
+        self.history_tab.clear_history()
+        self.history_tab.set_notes(data.get("history_notes", {}))
+        for flow in data.get("history_flows", []):
+            self.history_tab.add_request(flow)
+        for fid, resp in data.get("history_responses", {}).items():
+            resp["flow_id"] = fid
+            self.history_tab.update_response(resp)
+
+        self.repeater_tab.import_sessions(data.get("repeater_sessions", []))
+
+        self.scope_manager.load_from_list(data.get("scope_rules", []))
+        self.scope_manager.enabled = data.get("scope_enabled", False)
+
+        self.match_replace_engine.load_from_list(data.get("match_replace_rules", []))
+        self.match_replace_engine.enabled = data.get("match_replace_enabled", False)
+
+        cfg = data.get("config", {})
+        if cfg:
+            save_config(cfg)
+        self._apply_config()
+
+        QMessageBox.information(self, "Success", "Session loaded successfully.")
+
+    # ══════════════════════════════════════════
+    # Config & Certs
+    # ══════════════════════════════════════════
     def _apply_config(self):
         cfg = load_config()
         self.host_input.setText(str(cfg.get("host", "127.0.0.1")))
         self.port_input.setValue(int(cfg.get("port", 8080)))
+        
         intercept_enabled = bool(cfg.get("intercept_enabled", False))
         self.btn_intercept.setChecked(intercept_enabled)
         self._on_intercept_toggle(intercept_enabled)
+
+        resp_intercept_enabled = bool(cfg.get("response_intercept_enabled", False))
+        self.btn_resp_intercept.setChecked(resp_intercept_enabled)
+        self._on_resp_intercept_toggle(resp_intercept_enabled)
+
+        self.scope_manager.enabled = cfg.get("scope_enabled", False)
+        self.scope_manager.load_from_list(cfg.get("scope_rules", []))
+
+        self.match_replace_engine.enabled = cfg.get("match_replace_enabled", False)
+        self.match_replace_engine.load_from_list(cfg.get("match_replace_rules", []))
 
     def _save_config(self):
         cfg = {
             "host": self.host_input.text().strip() or "127.0.0.1",
             "port": self.port_input.value(),
             "intercept_enabled": self.btn_intercept.isChecked(),
+            "response_intercept_enabled": self.btn_resp_intercept.isChecked(),
+            "scope_enabled": self.scope_manager.enabled,
+            "scope_rules": self.scope_manager.to_list(),
+            "match_replace_enabled": self.match_replace_engine.enabled,
+            "match_replace_rules": self.match_replace_engine.to_list()
         }
         save_config(cfg)
 

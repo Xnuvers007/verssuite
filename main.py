@@ -28,6 +28,7 @@ from PyQt5.QtWidgets import QApplication, QSplashScreen, QLabel
 from PyQt5.QtCore    import Qt, QTimer
 from PyQt5.QtGui     import QFont, QPixmap, QPainter, QColor, QLinearGradient
 
+from core.version import APP_NAME, APP_VERSION, APP_AUTHOR
 from ui.main_window import MainWindow
 from ui.styles      import DARK_STYLESHEET
 
@@ -86,9 +87,9 @@ def main():
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
     app = QApplication(sys.argv)
-    app.setApplicationName("Vers Suite")
-    app.setApplicationVersion("1.0.0")
-    app.setOrganizationName("Xnuvers007")
+    app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
+    app.setOrganizationName(APP_AUTHOR)
     app.setStyleSheet(DARK_STYLESHEET)
 
     # Splash

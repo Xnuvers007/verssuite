@@ -7,7 +7,7 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QTableWidget, QTableWidgetItem, QTextEdit, QLabel,
     QPushButton, QHeaderView, QLineEdit, QComboBox, QAbstractItemView,
-    QFileDialog, QMenu, QAction, QApplication
+    QFileDialog, QMenu, QAction, QApplication, QCheckBox, QInputDialog
 )
 import json
 import csv
@@ -15,6 +15,7 @@ from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QFont
 from .styles import status_color, COLORS
 from .intercept_tab import HttpHighlighter
+from core.sensitive_patterns import has_sensitive_data
 
 
 class HistoryTab(QWidget):
@@ -25,6 +26,7 @@ class HistoryTab(QWidget):
         super().__init__(parent)
         self._flows: dict = {}   # flow_id -> flow_data
         self._responses: dict = {}
+        self._notes: dict = {}   # flow_id -> note string
         self._order: list = []   # ordered flow_ids
         self._setup_ui()
 
@@ -38,7 +40,7 @@ class HistoryTab(QWidget):
         tb.setSpacing(8)
 
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("🔍  Filter (URL, method, status…)")
+        self.search_box.setPlaceholderText("🔍  Filter (URL, method, status, notes…)")
         self.search_box.textChanged.connect(self._apply_filter)
         self.search_box.setMaximumWidth(360)
         tb.addWidget(self.search_box)
@@ -47,6 +49,11 @@ class HistoryTab(QWidget):
         self.method_filter.addItems(["All Methods", "GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
         self.method_filter.currentTextChanged.connect(self._apply_filter)
         tb.addWidget(self.method_filter)
+
+        self.chk_scope_only = QCheckBox("Scope Only")
+        self.chk_scope_only.setToolTip("Show only in-scope requests")
+        self.chk_scope_only.stateChanged.connect(self._apply_filter)
+        tb.addWidget(self.chk_scope_only)
 
         tb.addStretch()
 
@@ -89,11 +96,12 @@ class HistoryTab(QWidget):
         splitter = QSplitter(Qt.Vertical)
 
         # Request table
-        self.table = QTableWidget(0, 7)
+        self.table = QTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels(
-            ["#", "Method", "Host", "Path", "Status", "Length", "Time (ms)"]
+            ["#", "Method", "Host", "Path", "Status", "Length", "Time (ms)", "⚠", "Notes"]
         )
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(8, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Interactive)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -106,9 +114,11 @@ class HistoryTab(QWidget):
         self.table.setColumnWidth(4, 60)
         self.table.setColumnWidth(5, 80)
         self.table.setColumnWidth(6, 75)
+        self.table.setColumnWidth(7, 30)
         self.table.currentCellChanged.connect(self._on_row_select)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_table_menu)
+        self.table.doubleClicked.connect(self._on_double_click)
         splitter.addWidget(self.table)
 
         # Detail panel
@@ -212,6 +222,23 @@ class HistoryTab(QWidget):
         self.btn_intruder.setEnabled(False)
         self.lbl_count.setText("0 requests")
 
+    def get_notes(self) -> dict:
+        """Return all notes for session save."""
+        return dict(self._notes)
+
+    def set_notes(self, notes: dict):
+        """Restore notes from session load."""
+        self._notes = dict(notes)
+        # Update table
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item:
+                fid = item.data(Qt.UserRole)
+                note = self._notes.get(fid, "")
+                notes_item = self.table.item(row, 8)
+                if notes_item:
+                    notes_item.setText(note)
+
     # ── Private helpers ────────────────────────
     def _format_size(self, n: int) -> str:
         if n < 1024: return f"{n} B"
@@ -243,6 +270,22 @@ class HistoryTab(QWidget):
                 item.setForeground(QColor(color_map.get(flow_data.get("method",""), "#c0c0cc")))
             self.table.setItem(row, col, item)
 
+        # Sensitive data badge (column 7)
+        raw_text = self._build_raw_request(flow_data)
+        sensitive = has_sensitive_data(raw_text)
+        badge_item = QTableWidgetItem("⚠" if sensitive else "")
+        badge_item.setTextAlignment(Qt.AlignCenter)
+        badge_item.setForeground(QColor("#ff5252" if sensitive else "#303040"))
+        badge_item.setData(Qt.UserRole, fid)
+        self.table.setItem(row, 7, badge_item)
+
+        # Notes column (column 8)
+        note = self._notes.get(fid, "")
+        note_item = QTableWidgetItem(note)
+        note_item.setForeground(QColor("#7070a0"))
+        note_item.setData(Qt.UserRole, fid)
+        self.table.setItem(row, 8, note_item)
+
     def _apply_filter(self):
         method_f = self.method_filter.currentText()
         text_f   = self.search_box.text().lower()
@@ -261,7 +304,14 @@ class HistoryTab(QWidget):
             if method_f != "All Methods" and method != method_f:
                 visible = False
             if text_f and text_f not in url and text_f not in host and text_f not in status:
-                visible = False
+                # Also search in notes
+                note = self._notes.get(fid, "").lower()
+                if text_f not in note:
+                    visible = False
+            if self.chk_scope_only.isChecked():
+                flow_obj = self._flows.get(fid, {})
+                if not flow_obj.get("in_scope", True):
+                    visible = False
             self.table.setRowHidden(row, not visible)
 
     def _on_row_select(self, row, col, prev_row, prev_col):
@@ -347,6 +397,15 @@ class HistoryTab(QWidget):
         menu.addAction(act_send_repeater)
         menu.addAction(act_send_intruder)
 
+        menu.addSeparator()
+        act_edit_note = QAction("📝 Edit Note", self)
+        act_edit_note.triggered.connect(lambda: self._edit_note_for_flow(fid))
+        menu.addAction(act_edit_note)
+
+        act_to_comparer = QAction("⇄ Send to Comparer (Left)", self)
+        act_to_comparer.triggered.connect(lambda: self._send_to_comparer(flow, resp))
+        menu.addAction(act_to_comparer)
+
         def to_clipboard(text: str):
             QApplication.clipboard().setText(text or "")
 
@@ -367,6 +426,43 @@ class HistoryTab(QWidget):
         act_send_intruder.triggered.connect(self._on_to_intruder)
 
         menu.exec_(self.table.viewport().mapToGlobal(pos))
+
+    def _on_double_click(self, index):
+        """Double-click on Notes column to edit."""
+        if index.column() == 8:  # Notes column
+            item = self.table.item(index.row(), 0)
+            if not item:
+                return
+            fid = item.data(Qt.UserRole)
+            self._edit_note_for_flow(fid)
+
+    def _edit_note_for_flow(self, fid: str):
+        current_note = self._notes.get(fid, "")
+        text, ok = QInputDialog.getText(
+            self, "Edit Note", "Note for this request:",
+            text=current_note
+        )
+        if ok:
+            self._notes[fid] = text
+            # Update table cell
+            for row in range(self.table.rowCount()):
+                row_item = self.table.item(row, 0)
+                if row_item and row_item.data(Qt.UserRole) == fid:
+                    notes_item = self.table.item(row, 8)
+                    if notes_item:
+                        notes_item.setText(text)
+                    break
+
+    def _send_to_comparer(self, flow: dict, resp: dict):
+        from PyQt5.QtCore import QCoreApplication
+        app = QCoreApplication.instance()
+        for w in app.topLevelWidgets():
+            if hasattr(w, "comparer_tab"):
+                raw_req = self._build_raw_request(flow)
+                w.comparer_tab.load_left(raw_req)
+                if hasattr(w, "comparer_page"):
+                    w.tabs.setCurrentWidget(w.comparer_page)
+                break
 
     def _headers_to_text(self, headers: dict) -> str:
         if not headers:

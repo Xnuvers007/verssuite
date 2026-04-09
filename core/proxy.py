@@ -38,19 +38,28 @@ class VersAddon:
     """
     mitmproxy addon that bridges proxy events to the PyQt5 UI.
     Uses asyncio.Event per flow for non-blocking intercept.
+    Supports scope filtering, response interception, match/replace, and WebSocket.
     """
 
     def __init__(
         self,
         event_queue: queue.Queue,
         intercept_enabled: threading.Event,
+        response_intercept_enabled: threading.Event,
         loop_ref: list,           # [asyncio.AbstractEventLoop]
         action_store: dict,       # flow_id -> {action, modifications, async_event}
+        resp_action_store: dict,  # flow_id -> {action, modifications, async_event}
+        scope_manager=None,
+        match_replace_engine=None,
     ):
         self.event_queue = event_queue
         self.intercept_enabled = intercept_enabled
+        self.response_intercept_enabled = response_intercept_enabled
         self.loop_ref = loop_ref
         self.action_store = action_store
+        self.resp_action_store = resp_action_store
+        self.scope_manager = scope_manager
+        self.match_replace_engine = match_replace_engine
         self._flow_index: Dict[str, Any] = {}
 
     # ── helpers ──────────────────────────────
@@ -91,7 +100,22 @@ class VersAddon:
         from mitmproxy import http as mhttp
         self._flow_index[flow.id] = flow
 
-        if self.intercept_enabled.is_set():
+        # Scope check
+        in_scope = True
+        if self.scope_manager:
+            in_scope = self.scope_manager.is_in_scope(flow.request.pretty_url)
+
+        # Apply match & replace rules to request
+        if self.match_replace_engine and self.match_replace_engine.enabled:
+            headers = dict(flow.request.headers)
+            body = flow.request.content.decode("utf-8", errors="replace")
+            headers, body = self.match_replace_engine.apply_request(headers, body)
+            flow.request.headers.clear()
+            for k, v in headers.items():
+                flow.request.headers[k] = v
+            flow.request.content = body.encode("utf-8")
+
+        if self.intercept_enabled.is_set() and in_scope:
             flow.intercept()
             async_event = asyncio.Event()
             self.action_store[flow.id] = {
@@ -102,6 +126,7 @@ class VersAddon:
 
             self.event_queue.put({
                 "type": "intercept",
+                "in_scope": in_scope,
                 **self._flow_to_dict(flow),
             })
 
@@ -130,14 +155,67 @@ class VersAddon:
         else:
             self.event_queue.put({
                 "type": "history",
+                "in_scope": in_scope,
                 **self._flow_to_dict(flow),
             })
 
     async def response(self, flow):
-        self.event_queue.put({
-            "type": "response",
-            **self._response_to_dict(flow),
-        })
+        # Apply match & replace rules to response
+        if self.match_replace_engine and self.match_replace_engine.enabled:
+            headers = dict(flow.response.headers)
+            body = flow.response.content.decode("utf-8", errors="replace")
+            headers, body = self.match_replace_engine.apply_response(headers, body)
+            flow.response.headers.clear()
+            for k, v in headers.items():
+                flow.response.headers[k] = v
+            flow.response.content = body.encode("utf-8")
+
+        # Response interception
+        in_scope = True
+        if self.scope_manager:
+            in_scope = self.scope_manager.is_in_scope(flow.request.pretty_url)
+
+        if self.response_intercept_enabled.is_set() and in_scope:
+            flow.intercept()
+            async_event = asyncio.Event()
+            self.resp_action_store[flow.id] = {
+                "action":        "forward",
+                "modifications": {},
+                "async_event":   async_event,
+            }
+
+            self.event_queue.put({
+                "type": "response_intercept",
+                "flow_id": flow.id,
+                **self._response_to_dict(flow),
+            })
+
+            await async_event.wait()
+
+            entry = self.resp_action_store.pop(flow.id, {})
+            action = entry.get("action", "forward")
+            mods   = entry.get("modifications", {})
+
+            if action == "drop":
+                flow.kill()
+                return
+
+            if mods:
+                if "body" in mods:
+                    flow.response.content = mods["body"].encode("utf-8")
+                if "headers" in mods:
+                    flow.response.headers.clear()
+                    for k, v in mods["headers"].items():
+                        flow.response.headers[k] = v
+                if "status_code" in mods:
+                    flow.response.status_code = mods["status_code"]
+
+            flow.resume()
+        else:
+            self.event_queue.put({
+                "type": "response",
+                **self._response_to_dict(flow),
+            })
 
     async def error(self, flow):
         self.event_queue.put({
@@ -145,6 +223,24 @@ class VersAddon:
             "flow_id": flow.id,
             "message": str(flow.error),
         })
+
+    def websocket_message(self, flow):
+        """Capture WebSocket messages (if supported by mitmproxy version)."""
+        try:
+            msg = flow.websocket.messages[-1]
+            self.event_queue.put({
+                "type": "websocket",
+                "flow_id": flow.id,
+                "url": flow.request.pretty_url,
+                "host": flow.request.pretty_host,
+                "direction": "outgoing" if msg.from_client else "incoming",
+                "content": msg.text if hasattr(msg, 'text') else msg.content.decode('utf-8', 'replace'),
+                "is_text": msg.is_text if hasattr(msg, 'is_text') else True,
+                "length": len(msg.content) if hasattr(msg, 'content') else 0,
+                "timestamp": time.strftime("%H:%M:%S"),
+            })
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────
@@ -159,13 +255,17 @@ class ProxyServer:
     def __init__(self):
         self.event_queue    = queue.Queue()
         self.intercept_enabled = threading.Event()
+        self.response_intercept_enabled = threading.Event()
         self.action_store   = {}   # flow_id -> action dict
+        self.resp_action_store = {}   # flow_id -> response action dict
         self._loop_ref      = [None]   # holds the asyncio loop
         self._master        = None
         self._thread        = None
         self.running        = False
         self.host           = "127.0.0.1"
         self.port           = 8080
+        self.scope_manager  = None
+        self.match_replace_engine = None
 
     # ── lifecycle ─────────────────────────────
     def start(self, host: str = "127.0.0.1", port: int = 8080):
@@ -239,8 +339,12 @@ class ProxyServer:
         addon = VersAddon(
             self.event_queue,
             self.intercept_enabled,
+            self.response_intercept_enabled,
             self._loop_ref,
             self.action_store,
+            self.resp_action_store,
+            self.scope_manager,
+            self.match_replace_engine,
         )
         self._master.addons.add(addon)
         self.event_queue.put({"type": "proxy_started", "host": host, "port": port})
@@ -293,10 +397,50 @@ class ProxyServer:
         except Exception as e:
             _safe_log(logging.WARNING, f"Error releasing flow {flow_id}: {e}")
 
+    # ── response intercept actions ─────────────
+    def forward_response(self, flow_id: str, modifications: dict = None):
+        loop = self._loop_ref[0]
+        if loop and flow_id in self.resp_action_store:
+            entry = self.resp_action_store[flow_id]
+            entry["action"] = "forward"
+            entry["modifications"] = modifications or {}
+            self._set_resp_event_threadsafe(loop, flow_id)
+
+    def drop_response(self, flow_id: str):
+        loop = self._loop_ref[0]
+        if loop and flow_id in self.resp_action_store:
+            self.resp_action_store[flow_id]["action"] = "drop"
+            self._set_resp_event_threadsafe(loop, flow_id)
+
+    def flush_response_intercepts(self):
+        loop = self._loop_ref[0]
+        if not loop or loop.is_closed():
+            return
+        for flow_id, entry in list(self.resp_action_store.items()):
+            entry["action"] = "forward"
+            entry["modifications"] = {}
+            self._set_resp_event_threadsafe(loop, flow_id)
+
+    def _set_resp_event_threadsafe(self, loop, flow_id):
+        entry = self.resp_action_store.get(flow_id)
+        if not entry:
+            return
+        async_event = entry.get("async_event")
+        if not async_event:
+            return
+        try:
+            loop.call_soon_threadsafe(async_event.set)
+        except Exception as e:
+            _safe_log(logging.WARNING, f"Error releasing response {flow_id}: {e}")
+
     # ── state helpers ─────────────────────────
     def enable_intercept(self):  self.intercept_enabled.set()
     def disable_intercept(self): self.intercept_enabled.clear()
     def is_intercepting(self) -> bool: return self.intercept_enabled.is_set()
+
+    def enable_response_intercept(self):  self.response_intercept_enabled.set()
+    def disable_response_intercept(self): self.response_intercept_enabled.clear()
+    def is_response_intercepting(self) -> bool: return self.response_intercept_enabled.is_set()
 
     def get_cert_path(self) -> Optional[str]:
         import os

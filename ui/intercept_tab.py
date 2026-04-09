@@ -1,6 +1,7 @@
 """
 Vers Suite - Intercept Tab
 Real-time request viewing, editing, forwarding and dropping.
+Supports response interception and sensitive data detection.
 """
 
 from PyQt5.QtWidgets import (
@@ -11,6 +12,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, pyqtSignal
 from core import load_config, save_config
+from core.sensitive_patterns import scan_text, has_sensitive_data, get_severity_color
 from PyQt5.QtGui import QFont, QColor, QTextCharFormat, QSyntaxHighlighter
 import re
 import socket
@@ -71,12 +73,17 @@ class InterceptTab(QWidget):
     drop_signal    = pyqtSignal(str)          # flow_id
     forward_all_signal = pyqtSignal()
     drop_all_signal    = pyqtSignal()
+    # Response intercept signals
+    response_forward_signal = pyqtSignal(str, dict)   # (flow_id, modifications)
+    response_drop_signal    = pyqtSignal(str)          # flow_id
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._current_flow_id: str | None = None
         self._flows: dict = {}
         self._responses: dict = {}
+        self._intercepted_responses: dict = {}  # flow_id -> response data
+        self._current_resp_flow_id: str | None = None
         self._dns_cache: dict = {}
         self._confirm_drop_all = True
         self._order: list = []
@@ -129,11 +136,17 @@ class InterceptTab(QWidget):
         self.btn_to_intruder.clicked.connect(self._on_send_to_intruder)
         self.btn_to_intruder.setEnabled(False)
 
+        # Sensitive data badge
+        self.lbl_sensitive = QLabel("")
+        self.lbl_sensitive.setStyleSheet("color: #ff5252; font-weight: bold; font-size: 11px;")
+        self.lbl_sensitive.setVisible(False)
+
         for btn in [
             self.btn_forward, self.btn_drop, self.btn_forward_all, self.btn_drop_all,
             self.btn_to_repeater, self.btn_to_intruder
         ]:
             top_bar.addWidget(btn)
+        top_bar.addWidget(self.lbl_sensitive)
 
         layout.addLayout(top_bar)
 
@@ -231,6 +244,46 @@ class InterceptTab(QWidget):
 
         layout.addWidget(main_splitter, stretch=1)
 
+        # ── Response Intercept Pane ───────────────
+        resp_intercept_widget = QWidget()
+        resp_layout = QVBoxLayout(resp_intercept_widget)
+        resp_layout.setContentsMargins(0, 4, 0, 0)
+        resp_layout.setSpacing(4)
+
+        resp_bar = QHBoxLayout()
+        resp_hdr = QLabel("INTERCEPTED RESPONSE  —  edit before forwarding to browser")
+        resp_hdr.setStyleSheet("color:#505070; font-size:10px; font-weight:600; letter-spacing:1px;")
+        resp_bar.addWidget(resp_hdr)
+        resp_bar.addStretch()
+
+        self.btn_resp_forward = QPushButton("▶  Forward Response")
+        self.btn_resp_forward.setObjectName("btn_forward")
+        self.btn_resp_forward.clicked.connect(self._on_response_forward)
+        self.btn_resp_forward.setEnabled(False)
+        resp_bar.addWidget(self.btn_resp_forward)
+
+        self.btn_resp_drop = QPushButton("✖  Drop Response")
+        self.btn_resp_drop.setObjectName("btn_drop")
+        self.btn_resp_drop.clicked.connect(self._on_response_drop)
+        self.btn_resp_drop.setEnabled(False)
+        resp_bar.addWidget(self.btn_resp_drop)
+
+        resp_layout.addLayout(resp_bar)
+
+        self.response_edit = QTextEdit()
+        self.response_edit.setObjectName("response_view")
+        self.response_edit.setPlaceholderText(
+            "Intercepted response will appear here when Response Interception is enabled."
+        )
+        font2 = QFont("Cascadia Code", 11)
+        font2.setStyleHint(QFont.Monospace)
+        self.response_edit.setFont(font2)
+        self.response_edit.setMaximumHeight(200)
+        self._hl_resp = HttpHighlighter(self.response_edit.document())
+        resp_layout.addWidget(self.response_edit)
+
+        layout.addWidget(resp_intercept_widget)
+
     # ── Internal helpers ───────────────────────
     def _raw_text_to_modifications(self) -> dict:
         """Parse the edited request text back into modifications dict."""
@@ -291,6 +344,28 @@ class InterceptTab(QWidget):
         if self.table.currentRow() < 0:
             self.table.selectRow(self.table.rowCount() - 1)
         self._update_status()
+
+    def show_intercepted_response(self, resp_data: dict):
+        """Show an intercepted response for editing before forwarding to browser."""
+        fid = resp_data.get("flow_id")
+        if not fid:
+            return
+        self._intercepted_responses[fid] = resp_data
+        self._current_resp_flow_id = fid
+
+        # Build raw response text
+        lines = []
+        status = resp_data.get("status_code", "?")
+        reason = resp_data.get("reason", "")
+        lines.append(f"HTTP/1.1 {status} {reason}")
+        for k, v in resp_data.get("headers", {}).items():
+            lines.append(f"{k}: {v}")
+        lines.append("")
+        lines.append(resp_data.get("body", ""))
+
+        self.response_edit.setPlainText("\n".join(lines))
+        self.btn_resp_forward.setEnabled(True)
+        self.btn_resp_drop.setEnabled(True)
 
     def update_response_meta(self, resp_data: dict):
         fid = resp_data.get("flow_id")
@@ -393,6 +468,16 @@ class InterceptTab(QWidget):
         ]:
             btn.setEnabled(True)
         self._update_status()
+
+        # Sensitive data check
+        raw_text = self.request_edit.toPlainText()
+        if has_sensitive_data(raw_text):
+            matches = scan_text(raw_text, max_matches=5)
+            types = set(m.type for m in matches)
+            self.lbl_sensitive.setText(f"⚠ Sensitive: {', '.join(types)}")
+            self.lbl_sensitive.setVisible(True)
+        else:
+            self.lbl_sensitive.setVisible(False)
 
     def _remove_current_flow(self):
         fid = self._current_flow_id
@@ -665,3 +750,59 @@ class InterceptTab(QWidget):
             return True
         server = headers.get("server", "")
         return "cloudflare" in str(server).lower()
+
+    # ── Response intercept handlers ─────────────
+    def _on_response_forward(self):
+        fid = self._current_resp_flow_id
+        if not fid:
+            return
+        mods = self._parse_response_edits()
+        self.response_forward_signal.emit(fid, mods)
+        self.response_edit.clear()
+        self.btn_resp_forward.setEnabled(False)
+        self.btn_resp_drop.setEnabled(False)
+        self._current_resp_flow_id = None
+
+    def _on_response_drop(self):
+        fid = self._current_resp_flow_id
+        if not fid:
+            return
+        self.response_drop_signal.emit(fid)
+        self.response_edit.clear()
+        self.btn_resp_forward.setEnabled(False)
+        self.btn_resp_drop.setEnabled(False)
+        self._current_resp_flow_id = None
+
+    def _parse_response_edits(self) -> dict:
+        """Parse edited response text into a modifications dict."""
+        text = self.response_edit.toPlainText()
+        lines = text.split("\n")
+        mods = {}
+        if not lines:
+            return mods
+
+        # First line: HTTP/VERSION STATUS REASON
+        first = lines[0].strip().split(None, 2)
+        if len(first) >= 2:
+            try:
+                mods["status_code"] = int(first[1])
+            except ValueError:
+                pass
+
+        # Headers + body
+        headers = {}
+        body_start = None
+        for i, line in enumerate(lines[1:], start=1):
+            if line.strip() == "":
+                body_start = i + 1
+                break
+            if ":" in line:
+                k, _, v = line.partition(":")
+                headers[k.strip()] = v.strip()
+
+        if headers:
+            mods["headers"] = headers
+        if body_start is not None:
+            mods["body"] = "\n".join(lines[body_start:])
+
+        return mods

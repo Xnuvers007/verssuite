@@ -20,6 +20,45 @@ QWidget {
     font-size: 13px;
 }
 
+/* ── Menu Bar ───────────────────────────────*/
+QMenuBar {
+    background-color: #0a0a0f;
+    color: #e0e0e0;
+    border-bottom: 1px solid #1e1e2e;
+}
+
+QMenuBar::item {
+    padding: 6px 12px;
+    background: transparent;
+    border-radius: 3px;
+}
+
+QMenuBar::item:selected {
+    background-color: #1a1a2e;
+}
+
+QMenu {
+    background-color: #13131a;
+    color: #c8c8cc;
+    border: 1px solid #2a2a3e;
+    padding: 4px 0px;
+}
+
+QMenu::item {
+    padding: 6px 24px 6px 20px;
+}
+
+QMenu::item:selected {
+    background-color: #1a1a2e;
+    color: #00d4ff;
+}
+
+QMenu::separator {
+    height: 1px;
+    background: #2a2a3e;
+    margin: 4px 0px;
+}
+
 /* ── Tab Bar ────────────────────────────────*/
 QTabWidget::pane {
     border: 1px solid #1e1e2e;
@@ -158,6 +197,17 @@ QPushButton#btn_cert {
 QPushButton#btn_cert:hover {
     background-color: #2a2a00;
     border-color: #ffab00;
+}
+
+QPushButton#btn_update {
+    background-color: #001a1a;
+    color: #00e5c0;
+    border: 1px solid #00796b;
+    font-weight: 600;
+}
+QPushButton#btn_update:hover {
+    background-color: #002626;
+    border-color: #00e5c0;
 }
 
 /* ── Text Inputs ────────────────────────────*/
